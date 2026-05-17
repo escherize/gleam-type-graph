@@ -4,7 +4,7 @@
   "description": "Static type-graph extractor for Gleam codebases. Maps types to the functions that transform them, rendered as mermaid / graphviz / json / interactive HTML.",
   "type": "module",
   "bin": {
-    "gleam-type-graph": "./bin/gleam-type-graph.mjs"
+    "gleam-type-graph": "bin/gleam-type-graph.mjs"
   },
   "files": [
     "bin/",
