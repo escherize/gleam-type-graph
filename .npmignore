@@ -1,0 +1,10 @@
+# Build cache that isn't needed at runtime
+build/dev/javascript/**/_gleam_artefacts/
+build/dev/javascript/**/*_test.mjs
+
+# Erlang side of the build (we ship JS only)
+build/dev/erlang/
+
+# Editor / OS noise
+.DS_Store
+*.swp

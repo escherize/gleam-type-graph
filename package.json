@@ -1,0 +1,46 @@
+{
+  "name": "gleam-type-graph",
+  "version": "0.1.0",
+  "description": "Static type-graph extractor for Gleam codebases. Maps types to the functions that transform them, rendered as mermaid / graphviz / json / interactive HTML.",
+  "type": "module",
+  "bin": {
+    "gleam-type-graph": "./bin/gleam-type-graph.mjs"
+  },
+  "files": [
+    "bin/",
+    "build/dev/javascript/**/*.mjs",
+    "!build/dev/javascript/**/*_test.mjs",
+    "!build/dev/javascript/gleeunit/**",
+    "gleam.toml",
+    "manifest.toml"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "gleam build",
+    "prepack": "gleam build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/escherize/gleam-type-graph.git"
+  },
+  "homepage": "https://github.com/escherize/gleam-type-graph#readme",
+  "bugs": {
+    "url": "https://github.com/escherize/gleam-type-graph/issues"
+  },
+  "author": "Bryan Maass",
+  "license": "MIT",
+  "keywords": [
+    "gleam",
+    "type-graph",
+    "static-analysis",
+    "ast",
+    "mermaid",
+    "graphviz",
+    "diagram",
+    "documentation",
+    "glance",
+    "visualization"
+  ]
+}

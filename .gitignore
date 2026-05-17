@@ -1,0 +1,14 @@
+# Gleam build artifacts
+build/
+
+# npm
+node_modules/
+*.tgz
+package-lock.json
+
+# Notes / scratch
+worklog.md
+type_graph_tool.md
+
+# OS noise
+.DS_Store

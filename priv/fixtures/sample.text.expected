@@ -1,0 +1,11 @@
+Int --[money.from_cents]--> money.Money
+String --[customer.new_id]--> customer.CustomerId
+String --[extras.lookup_id]--> order.OrderId
+String --[extras.maybe_customer]--> customer.CustomerId
+String --[order.new_id]--> order.OrderId
+money.Money --[money.to_cents]--> Int
+order.Order --[extras.batch_snapshot]--> order.OrderSnapshot
+order.Order --[order.snapshot]--> order.OrderSnapshot
+{String, order.Order} --[order.merge]--> order.Order
+{customer.CustomerId, money.Money, order.OrderId} --[order.make_order]--> order.Order
+{customer.CustomerId, order.OrderSnapshot} --[order.restore]--> order.Order
