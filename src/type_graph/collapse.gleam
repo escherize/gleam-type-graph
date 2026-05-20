@@ -42,8 +42,8 @@ fn dedup_by_endpoints(edges: List(Edge)) -> List(Edge) {
 /// shows their relationships to user-defined modules.
 fn collapse_ref(t: TypeRef) -> TypeRef {
   case t {
-    graph.Qualified(module, _) -> graph.Qualified(module, "*")
-    graph.FanIn(module, _, _, _) -> graph.Qualified(module, "*")
+    graph.Qualified(module, _, _) -> graph.Qualified(module, "*", [])
+    graph.FanIn(module, _, _, _) -> graph.Qualified(module, "*", [])
     other -> other
   }
 }

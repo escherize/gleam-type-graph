@@ -82,7 +82,7 @@ Arguments:
                       looking for gleam.toml and uses its src/.
 
 Options:
-  --format <FMT>      Output format: mermaid|dot|json|text|html
+  --format <FMT>      Output format: mermaid|dot|json|text|html|cytoscape
                       (default: html when --open, mermaid otherwise)
   --open              Render to a temp file and open in your browser
   --collapse <MODE>   Collapse the graph. Modes: modules
@@ -364,6 +364,29 @@ fn run(cfg: Config) -> Nil {
                     )
                   deliver_or_print(html, format, cfg.open)
                 }
+                _, render.Cytoscape -> {
+                  let href_for =
+                    link_href(
+                      project,
+                      analyzed_modules,
+                      internal_ids,
+                      attr_internal_ids,
+                      source_locs,
+                      repo,
+                      False,
+                    )
+                  let html =
+                    render.render_cytoscape_html(
+                      project,
+                      src,
+                      kept,
+                      href_for,
+                      internal_ids,
+                      alias_bodies,
+                      cfg.theme,
+                    )
+                  deliver_or_print(html, format, cfg.open)
+                }
                 _, _ -> {
                   let output = render.render(kept, format)
                   deliver_or_print(output, format, cfg.open)
@@ -495,12 +518,12 @@ fn link_href(
 ) -> fn(graph.TypeRef) -> Option(String) {
   fn(ref: graph.TypeRef) -> Option(String) {
     case ref {
-      graph.Qualified(module, "*") ->
+      graph.Qualified(module, "*", _) ->
         case enable_module_drill_in && set.contains(analyzed, module) {
           True -> Some("#" <> view_id_for(module))
           False -> None
         }
-      graph.Qualified(module, name) ->
+      graph.Qualified(module, name, _) ->
         link_for_named(
           project,
           analyzed,
@@ -709,7 +732,7 @@ fn edge_touches_module(e: graph.Edge, module: String) -> Bool {
 
 fn ref_in_module(t: graph.TypeRef, module: String) -> Bool {
   case t {
-    graph.Qualified(m, _) -> m == module
+    graph.Qualified(m, _, _) -> m == module
     graph.FanIn(m, _, _, _) -> m == module
     _ -> False
   }

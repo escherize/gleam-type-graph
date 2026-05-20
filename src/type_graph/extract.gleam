@@ -319,14 +319,20 @@ fn strip_monadic(t: glance.Type) -> glance.Type {
 /// generics like `List(Order)` keep their parameters.
 fn format_type(t: glance.Type, imports: Imports) -> String {
   case t {
-    glance.NamedType(_, _, _, []) -> graph.type_label(resolve(t, imports))
-    glance.NamedType(_, _, _, params) -> {
-      let base = graph.type_label(resolve(t, imports))
+    glance.NamedType(_, name, module_opt, []) ->
+      graph.type_label(resolve_named(name, module_opt, imports, []))
+    glance.NamedType(_, name, module_opt, params) -> {
+      // Render the head with no params via `resolve_named` (so `type_label`
+      // doesn't double-format the parameterised form), then format each
+      // glance param recursively. This preserves type variables (`a`, `b`)
+      // and nested structure (`fn(a) -> b`, `#(Int, String)`) in the
+      // signature label — `resolve` would canonicalise/flatten them.
+      let head = graph.type_label(resolve_named(name, module_opt, imports, []))
       let inner =
         params
         |> list.map(fn(p) { format_type(p, imports) })
         |> string.join(", ")
-      base <> "(" <> inner <> ")"
+      head <> "(" <> inner <> ")"
     }
     glance.TupleType(_, elements) -> {
       let inner =
@@ -349,8 +355,15 @@ fn format_type(t: glance.Type, imports: Imports) -> String {
 
 fn resolve(t: glance.Type, imports: Imports) -> TypeRef {
   case t {
-    glance.NamedType(_, name, module_opt, _params) ->
-      resolve_named(name, module_opt, imports)
+    glance.NamedType(_, name, module_opt, params) -> {
+      let resolved_params = list.map(params, fn(p) { resolve(p, imports) })
+      let base = resolve_named(name, module_opt, imports, resolved_params)
+      // Canonicalise: a `List(a)`-shaped type collapses to bare `List`,
+      // while `List(Order)` keeps its parameterisation. This is the rule
+      // that lets generics share a single node and concrete containers
+      // become distinct nouns of the domain.
+      graph.canonical(base)
+    }
     glance.TupleType(_, _) -> graph.Tuple
     glance.FunctionType(_, _, _) -> graph.FunctionT
     glance.VariableType(_, name) -> graph.Generic(name)
@@ -362,20 +375,21 @@ fn resolve_named(
   name: String,
   module_opt: Option(String),
   imports: Imports,
+  params: List(TypeRef),
 ) -> TypeRef {
   case module_opt {
     Some(m) ->
       case dict.get(imports.module_aliases, m) {
-        Ok(full) -> graph.Qualified(full, name)
+        Ok(full) -> graph.Qualified(full, name, params)
         Error(_) -> graph.Unknown(m <> "." <> name)
       }
     None -> {
       case is_builtin(name) {
-        True -> graph.Primitive(name)
+        True -> graph.Primitive(name, params)
         False ->
           case dict.get(imports.local_types, name) {
-            Ok(full) -> graph.Qualified(full, name)
-            Error(_) -> graph.Qualified(imports.self, name)
+            Ok(full) -> graph.Qualified(full, name, params)
+            Error(_) -> graph.Qualified(imports.self, name, params)
           }
       }
     }

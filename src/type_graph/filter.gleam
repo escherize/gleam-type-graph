@@ -77,7 +77,7 @@ fn keep(edge: Edge, opts: Options, analyzed: Set(String)) -> Bool {
 
 fn is_primitive(t: TypeRef) -> Bool {
   case t {
-    graph.Primitive(_) -> True
+    graph.Primitive(_, _) -> True
     _ -> False
   }
 }
@@ -95,9 +95,9 @@ fn is_generic(t: TypeRef) -> Bool {
 /// construction and always count as domain.
 fn is_domain(t: TypeRef, analyzed: Set(String)) -> Bool {
   case t {
-    graph.Qualified(module, _) -> set.contains(analyzed, module)
+    graph.Qualified(module, _, _) -> set.contains(analyzed, module)
     graph.FanIn(_, _, _, _) -> True
-    graph.Primitive(_)
+    graph.Primitive(_, _)
     | graph.Generic(_)
     | graph.Tuple
     | graph.FunctionT
@@ -136,7 +136,7 @@ fn matches_modules(
 
 fn ref_module(t: TypeRef) -> String {
   case t {
-    graph.Qualified(module, _) -> module
+    graph.Qualified(module, _, _) -> module
     _ -> ""
   }
 }

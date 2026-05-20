@@ -13,6 +13,10 @@ pub type Format {
   Json
   Text
   Html
+  /// Cytoscape.js-rendered HTML: compound nodes for modules (click to
+  /// expand/collapse), force-directed layout, hover-highlight of upstream
+  /// and downstream neighbors, click-to-focus on a node's neighborhood.
+  Cytoscape
 }
 
 /// One named diagram in a multi-view HTML page. `id` is the JS-safe key
@@ -28,6 +32,7 @@ pub fn parse_format(s: String) -> Result(Format, String) {
     "json" -> Ok(Json)
     "text" | "txt" -> Ok(Text)
     "html" -> Ok(Html)
+    "cytoscape" | "cy" -> Ok(Cytoscape)
     other -> Error("unknown format: " <> other)
   }
 }
@@ -40,6 +45,7 @@ pub fn extension(format: Format) -> String {
     Json -> "json"
     Text -> "txt"
     Html -> "html"
+    Cytoscape -> "html"
   }
 }
 
@@ -55,6 +61,16 @@ pub fn render(edges: List(Edge), format: Format) -> String {
     Text -> render_text(edges)
     Html ->
       render_html_single(
+        "",
+        "",
+        edges,
+        fn(_) { None },
+        set.new(),
+        dict.new(),
+        theme.dark(),
+      )
+    Cytoscape ->
+      render_cytoscape_html(
         "",
         "",
         edges,
@@ -265,9 +281,9 @@ fn do_render_mermaid(
             _ ->
               "  "
               <> from_id
-              <> " -->|\""
-              <> escape_mermaid(label)
-              <> "\"| "
+              <> " -->|"
+              <> sanitize_edge_label(label)
+              <> "| "
               <> to_id
           }
           #(i, "transform", line)
@@ -368,8 +384,8 @@ fn node_module(r: graph.TypeRef) -> String {
   case r {
     // A collapsed bubble *is* its module — wrapping it in a same-named
     // subgraph would be redundant framing. Keep it top-level.
-    graph.Qualified(_, "*") -> ""
-    graph.Qualified(module, _) -> module
+    graph.Qualified(_, "*", _) -> ""
+    graph.Qualified(module, _, _) -> module
     graph.FanIn(module, _, _, _) -> module
     _ -> ""
   }
@@ -417,7 +433,7 @@ fn emit_node(
 ) -> String {
   let alias_suffix = case dict.get(alias_bodies, graph.type_id(r)) {
     Ok(body) ->
-      "<br/><span class=&quot;alias-body&quot;>  = "
+      "<br/><span class='alias-body'>  = "
       <> mermaid_label(body)
       <> "</span>"
     Error(_) -> ""
@@ -436,6 +452,12 @@ fn emit_node(
 /// must pass through unescaped since mermaid renders them as breaks.
 fn mermaid_label(s: String) -> String {
   string.replace(s, "\"", "&quot;")
+}
+
+/// Mermaid v10 takes edge-label text between `|...|` literally — quoting it
+/// makes the parser reject the line. `|` itself would terminate the label.
+fn sanitize_edge_label(s: String) -> String {
+  string.replace(s, "|", "/")
 }
 
 /// Mermaid subgraph ids must be valid identifiers — drop anything else.
@@ -607,6 +629,8 @@ fn mermaid_init_js(theme: Theme) -> String {
         nodeTextColor: '" <> theme.text <> "',
       },
       flowchart: { useMaxWidth: true, curve: 'basis' },
+      maxEdges: 100000,
+      maxTextSize: 10000000,
     });"
 }
 
@@ -619,11 +643,11 @@ fn legend_html(theme: Theme) -> String {
     <> "\" stroke=\""
     <> theme.accent
     <> "\" stroke-width=\"1.4\"/></svg>type</span>
-      <span class=\"legend-item\"><svg width=\"22\" height=\"10\" viewBox=\"0 0 22 10\"><rect x=\"1\" y=\"1\" width=\"20\" height=\"8\" rx=\"2\" ry=\"2\" fill=\""
+      <span class=\"legend-item\"><svg width=\"22\" height=\"10\" viewBox=\"0 0 22 10\"><ellipse cx=\"11\" cy=\"5\" rx=\"10\" ry=\"4\" fill=\""
     <> theme.bg_node_fn
     <> "\" stroke=\""
-    <> theme.accent_dim
-    <> "\" stroke-width=\"1\"/></svg>function</span>
+    <> theme.input_color
+    <> "\" stroke-width=\"1.2\"/></svg>function</span>
       <span class=\"legend-item\"><svg width=\"22\" height=\"10\" viewBox=\"0 0 22 10\"><rect x=\"1\" y=\"1\" width=\"20\" height=\"8\" rx=\"2\" ry=\"2\" fill=\""
     <> theme.bg_node_type
     <> "\" stroke=\""
@@ -1049,6 +1073,920 @@ fn escape_html(s: String) -> String {
   |> string.replace("&", "&amp;")
   |> string.replace("<", "&lt;")
   |> string.replace(">", "&gt;")
+}
+
+// ---------------------------------------------------------------------------
+// Cytoscape.js HTML
+//
+// One page, force-directed layout, compound nodes per module, click-to-focus
+// neighborhood, hover to highlight upstream/downstream, click a module
+// header to expand/collapse it. The Gleam side just emits JSON node/edge
+// data plus a static HTML shell; cytoscape, fcose, and the expand-collapse
+// plugin are pulled from a CDN.
+
+pub fn render_cytoscape_html(
+  project: String,
+  source_path: String,
+  edges: List(Edge),
+  href_for: fn(TypeRef) -> Option(String),
+  internal_ids: Set(String),
+  alias_bodies: dict.Dict(String, String),
+  t: Theme,
+) -> String {
+  // Drop edges that touch a generic type variable (`a`, `acc`, `b`, ...).
+  // The default filter only removes generics from non-fan-in edges, so
+  // they survive on fan-in inputs/outputs and litter the canvas with
+  // floating nodes that connect everything to everything. For the
+  // interactive cytoscape view, the function-signature label on the
+  // fan-in already shows which params were generic — the standalone
+  // node carries no information.
+  let edges = list.filter(edges, fn(e) { !edge_touches_generic(e) })
+  let table = build_node_table(edges)
+  let modules = unique_modules(table.ordered)
+  let module_nodes =
+    list.map(modules, fn(m) {
+      "    { data: { id: \"mod:"
+      <> escape_json(m)
+      <> "\", label: \""
+      <> escape_json(m)
+      <> "\", kind: \"module\" } }"
+    })
+  let type_nodes =
+    list.map(table.ordered, fn(r) {
+      cyto_node_json(table, r, internal_ids, alias_bodies, href_for)
+    })
+  let short_to_full = build_short_to_full(table.ordered)
+  let edge_nodes =
+    list.index_map(edges, fn(e, i) {
+      cyto_edge_json(table, e, "e" <> int.to_string(i), short_to_full, href_for)
+    })
+  let nodes_json = string.join(list.flatten([module_nodes, type_nodes]), ",\n")
+  let edges_json = string.join(edge_nodes, ",\n")
+  cytoscape_html_template(project, source_path, nodes_json, edges_json, t)
+}
+
+fn edge_touches_generic(e: Edge) -> Bool {
+  let Edge(from, to, _) = e
+  is_generic_ref(from) || is_generic_ref(to)
+}
+
+fn is_generic_ref(r: TypeRef) -> Bool {
+  case r {
+    graph.Generic(_) -> True
+    _ -> False
+  }
+}
+
+fn unique_modules(refs: List(TypeRef)) -> List(String) {
+  refs
+  |> list.filter_map(fn(r) {
+    case r {
+      graph.Qualified(m, _, _) -> Ok(m)
+      graph.FanIn(m, _, _, _) -> Ok(m)
+      _ -> Error(Nil)
+    }
+  })
+  |> list.unique
+  |> list.sort(string.compare)
+}
+
+fn cyto_node_json(
+  table: NodeTable,
+  r: TypeRef,
+  internal_ids: Set(String),
+  alias_bodies: dict.Dict(String, String),
+  href_for: fn(TypeRef) -> Option(String),
+) -> String {
+  let id = lookup(table, r)
+  let parent_field = case r {
+    graph.Qualified(m, _, _) -> ", parent: \"mod:" <> escape_json(m) <> "\""
+    graph.FanIn(m, _, _, _) -> ", parent: \"mod:" <> escape_json(m) <> "\""
+    _ -> ""
+  }
+  let label = case r {
+    graph.Qualified(m, _, _) -> graph.type_label_in_module(r, m)
+    graph.FanIn(m, _, _, _) -> graph.type_label_in_module(r, m)
+    _ -> graph.type_label(r)
+  }
+  let is_internal = set.contains(internal_ids, graph.type_id(r))
+  let kind = case graph.is_fan_in(r), is_internal {
+    True, True -> "fnode-internal"
+    True, False -> "fnode"
+    False, True -> "tnode-internal"
+    False, False -> "tnode"
+  }
+  let alias_field = case dict.get(alias_bodies, graph.type_id(r)) {
+    Ok(body) -> ", alias: \"= " <> escape_json(body) <> "\""
+    Error(_) -> ""
+  }
+  let href_field = case href_for(r) {
+    Some(url) -> ", href: \"" <> escape_json(url) <> "\""
+    None -> ""
+  }
+  "    { data: { id: \""
+  <> escape_json(id)
+  <> "\", label: "
+  <> json_string_literal(label)
+  <> ", kind: \""
+  <> kind
+  <> "\""
+  <> parent_field
+  <> alias_field
+  <> href_field
+  <> " } }"
+}
+
+fn cyto_edge_json(
+  table: NodeTable,
+  e: Edge,
+  eid: String,
+  short_to_full: dict.Dict(String, String),
+  href_for: fn(TypeRef) -> Option(String),
+) -> String {
+  let Edge(from, to, label) = e
+  let kind = edge_role(e)
+  let label_field = case kind, label {
+    "transform", lbl if lbl != "" ->
+      ", label: \"" <> escape_json(lbl) <> "\""
+    _, _ -> ""
+  }
+  // Single-arg functions are rendered as labelled edges. Attach the
+  // function's source href to the edge data so the JS can open the
+  // hex docs / github source when the user clicks the edge label.
+  let href_field = case kind, label {
+    "transform", lbl if lbl != "" ->
+      case edge_href_for(lbl, short_to_full, href_for) {
+        Some(url) -> ", href: \"" <> escape_json(url) <> "\""
+        None -> ""
+      }
+    _, _ -> ""
+  }
+  "    { data: { id: \""
+  <> eid
+  <> "\", source: \""
+  <> escape_json(lookup(table, from))
+  <> "\", target: \""
+  <> escape_json(lookup(table, to))
+  <> "\", kind: \""
+  <> kind
+  <> "\""
+  <> label_field
+  <> href_field
+  <> " } }"
+}
+
+/// Parse a `<short-module>.<fn_name>` edge label and look up the
+/// full module path from the analysed-modules table. Then construct
+/// a synthetic FanIn TypeRef and ask `href_for` for its source URL.
+fn edge_href_for(
+  label: String,
+  short_to_full: dict.Dict(String, String),
+  href_for: fn(TypeRef) -> Option(String),
+) -> Option(String) {
+  case string.split_once(label, ".") {
+    Error(_) -> None
+    Ok(#(short, name)) ->
+      case dict.get(short_to_full, short) {
+        Error(_) -> None
+        Ok(full) -> href_for(graph.FanIn(full, name, "", ""))
+      }
+  }
+}
+
+/// Lookup table: short module name → first full module path with that
+/// suffix. Used to resolve `bytes_tree.from_string_tree` on an edge
+/// back to the actual `gleam/bytes_tree` module that owns the function.
+fn build_short_to_full(refs: List(TypeRef)) -> dict.Dict(String, String) {
+  refs
+  |> list.filter_map(fn(r) {
+    case r {
+      graph.Qualified(m, _, _) -> Ok(#(graph.module_short(m), m))
+      graph.FanIn(m, _, _, _) -> Ok(#(graph.module_short(m), m))
+      _ -> Error(Nil)
+    }
+  })
+  |> dict.from_list
+}
+
+/// Emit a multi-line label as a JSON string literal. `graph.type_label`
+/// uses `\n` for wrapped fan-in signatures; cytoscape's `text-wrap: wrap`
+/// honours `\n` so we keep them verbatim.
+fn json_string_literal(s: String) -> String {
+  "\"" <> escape_json(s) <> "\""
+}
+
+fn cytoscape_html_template(
+  project: String,
+  source_path: String,
+  nodes_json: String,
+  edges_json: String,
+  t: Theme,
+) -> String {
+  "<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>" <> escape_html(project) <> " — type graph</title>
+  <style>
+" <> theme_css_vars(t) <> "
+    html, body { height: 100%; }
+    body { margin: 0; display: flex; flex-direction: column;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg-page); color: var(--text); }
+    header { padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--bg-header); }
+    header .meta { display: flex; flex-direction: column; gap: 2px; }
+    header .project { margin: 0; font-size: 20px; font-weight: 700; color: var(--accent); letter-spacing: -0.01em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    header .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-dim); }
+" <> shared_styles(t) <> "
+    main { flex: 1; min-height: 0; position: relative; }
+    /* Cursor states: canvas is grabbable (pan); switches to `grabbing`
+       while a drag/pan is in progress and to `pointer` when hovering an
+       interactable node — matched here with classes toggled from JS. */
+    /* `z-index: 0` on #cy creates a stacking context that contains
+       cytoscape's inner canvases. Without it, the canvases (which
+       cytoscape gives positive z-indices to) leak into the global
+       stacking order and float above the toolbar / hint / focus-info
+       overlays, making the buttons unclickable. */
+    #cy { position: absolute; inset: 0; background: var(--bg-panel); cursor: grab; z-index: 0; }
+    #cy.cy-grabbing { cursor: grabbing; }
+    #cy.cy-pointing { cursor: pointer; }
+    .toolbar {
+      position: absolute; top: 12px; right: 12px; display: flex; gap: 8px;
+      z-index: 10;
+    }
+    .toolbar button {
+      background: var(--bg-panel); color: var(--text); border: 1px solid var(--border);
+      border-radius: 4px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+      font-family: inherit;
+    }
+    .toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+    .hint {
+      position: absolute; bottom: 10px; left: 12px; font-size: 11px;
+      color: var(--text-dim); pointer-events: none; user-select: none;
+      background: rgba(21,24,42,0.85); padding: 6px 10px; border-radius: 4px;
+      border: 1px solid var(--border);
+      z-index: 10;
+    }
+    .focus-info {
+      position: absolute; top: 12px; left: 12px; font-size: 12px;
+      color: var(--text); background: var(--bg-panel);
+      border: 1px solid var(--accent); border-radius: 4px;
+      padding: 6px 10px; display: none;
+      z-index: 10;
+    }
+    .focus-info.active { display: block; }
+    .focus-info code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    /* Sticky right-click menu: appears at the cursor on cxttap and
+       stays until the user picks or clicks away. */
+    .ctx-menu {
+      position: fixed; z-index: 100; min-width: 160px;
+      background: var(--bg-panel); border: 1px solid var(--accent);
+      border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+      padding: 4px; display: none;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .ctx-menu button {
+      display: block; width: 100%; text-align: left;
+      background: transparent; color: var(--text);
+      border: none; padding: 6px 10px; font-size: 13px;
+      border-radius: 4px; cursor: pointer; font-family: inherit;
+    }
+    .ctx-menu button:hover { background: var(--accent); color: var(--bg-panel); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class=\"meta\">
+      <h1 class=\"project\">" <> escape_html(project) <> "</h1>
+      <code class=\"path\" title=\"" <> escape_html(source_path) <> "\">" <> escape_html(source_path) <> "</code>
+    </div>
+  </header>
+" <> legend_html(t) <> "
+  <main>
+    <div id=\"cy\"></div>
+    <div class=\"toolbar\">
+      <button id=\"btn-collapse-all\">collapse all modules</button>
+      <button id=\"btn-expand-all\">expand all modules</button>
+      <button id=\"btn-fit\">fit</button>
+      <button id=\"btn-freeze\" data-on=\"true\">freeze drag</button>
+    </div>
+    <div class=\"focus-info\" id=\"focus-info\"></div>
+    <div class=\"hint\">
+      hover to highlight neighbors · click a <b>type</b> to focus its neighborhood ·
+      click a <b>function</b> to open its source · click a <b>collapsed module</b> to expand ·
+      right-click anything for its source · click background to reset
+    </div>
+  </main>
+  <script src=\"https://cdn.jsdelivr.net/npm/cytoscape@3.30.0/dist/cytoscape.min.js\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/cytoscape-expand-collapse@4.1.1/cytoscape-expand-collapse.js\"></script>
+  <script>
+    const NODES = [
+" <> nodes_json <> "
+    ];
+    const EDGES = [
+" <> edges_json <> "
+    ];
+    const T = " <> theme_json(t) <> ";
+
+    const cy = cytoscape({
+      container: document.getElementById('cy'),
+      elements: { nodes: NODES, edges: EDGES },
+      wheelSensitivity: 0.2,
+      style: [
+        // Module nodes — base style. The expanded form (handled by
+        // the `:parent` override below) and the collapsed form
+        // (`.cy-expand-collapse-collapsed-node`) need to be visually
+        // unmistakable from each other and from regular type/function
+        // nodes, otherwise the user can't tell at a glance \"is this a
+        // module I should click to expand, or a noun I should click to
+        // focus?\"
+        { selector: 'node[kind=\"module\"]', style: {
+            'shape': 'tag',
+            'background-color': T.bg_cluster,
+            'border-color': T.accent,
+            'border-width': 2,
+            'label': 'data(label)',
+            'color': T.accent,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            'font-size': 16,
+            'font-weight': 700,
+            'padding': 14,
+            'text-valign': 'center',
+            'text-halign': 'center',
+            'width': 'label',
+            'height': 'label',
+            // Long module paths (`gleam/dynamic/decode`) blow out the tag
+            // horizontally if left unwrapped. Cap label width and let
+            // cytoscape break on `/` and whitespace.
+            'text-wrap': 'wrap',
+            'text-max-width': 140,
+            // `tag` shape draws a chevron on the right side; budget extra
+            // horizontal room so the label doesn't crash into it.
+            'text-margin-x': -8,
+        }},
+        // Collapsed module: tag shape, larger, with a `▸ ` chevron baked
+        // into the label by the post-collapse code. Stronger border and
+        // background so it reads as \"a thing you can pop open\" rather
+        // than \"another typed node.\"
+        { selector: 'node.cy-expand-collapse-collapsed-node', style: {
+            'shape': 'tag',
+            'background-color': T.bg_node_type,
+            'background-opacity': 1,
+            'border-color': T.accent,
+            'border-width': 3,
+            'font-size': 18,
+            'font-weight': 700,
+            'padding': 18,
+            'width': 'label',
+            'height': 'label',
+            'text-wrap': 'wrap',
+            'text-max-width': 160,
+            'text-margin-x': -10,
+        }},
+        // When the module is expanded, it becomes a compound (`:parent`).
+        // We drop the tag shape (compounds can only be rectangles), pin
+        // the label to the top, and soften the background so contained
+        // children stay legible.
+        { selector: ':parent', style: {
+            'shape': 'round-rectangle',
+            'background-opacity': 0.45,
+            'border-width': 1,
+            'border-style': 'dashed',
+            'font-size': 12,
+            'font-weight': 600,
+            'padding': 18,
+            'text-valign': 'top',
+            'text-margin-y': -6,
+            'color': T.text,
+        }},
+        // Types — the named domain nouns. Solid `round-rectangle` with
+        // a strong accent border and bold label — visually \"heavy\"
+        // because nouns are what you navigate by.
+        { selector: 'node[kind=\"tnode\"]', style: {
+            'shape': 'round-rectangle',
+            'background-color': T.bg_node_type,
+            'border-color': T.accent, 'border-width': 1.4,
+            'label': 'data(label)',
+            'color': T.text,
+            'text-valign': 'center', 'text-halign': 'center',
+            'text-wrap': 'wrap', 'text-max-width': 220,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            'font-size': 13, 'font-weight': 600,
+            'padding': 8,
+            'width': 'label', 'height': 'label',
+        }},
+        // Function fan-ins — the verbs. Barrel shape + warm (amber)
+        // border so they're clearly a different category from the
+        // cool-pink types at a glance. Italic text reinforces
+        // \"this is an action.\"
+        { selector: 'node[kind=\"fnode\"]', style: {
+            'shape': 'barrel',
+            'background-color': T.bg_node_fn,
+            'border-color': T.input_color,
+            'border-width': 1.2,
+            'label': 'data(label)',
+            'color': T.text,
+            'text-valign': 'center', 'text-halign': 'center',
+            'text-wrap': 'wrap', 'text-max-width': 280,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            'font-size': 11,
+            'font-style': 'italic',
+            'padding': 10,
+            'width': 'label', 'height': 'label',
+        }},
+        // @internal variants — same shapes, dashed border, dim text.
+        { selector: 'node[kind=\"tnode-internal\"]', style: {
+            'shape': 'round-rectangle',
+            'background-color': T.bg_node_type,
+            'border-color': T.accent_dim, 'border-width': 1.4,
+            'border-style': 'dashed',
+            'label': 'data(label)',
+            'color': T.text_dim,
+            'text-valign': 'center', 'text-halign': 'center',
+            'text-wrap': 'wrap', 'text-max-width': 220,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            'font-size': 13, 'font-weight': 600,
+            'padding': 8,
+            'width': 'label', 'height': 'label',
+        }},
+        { selector: 'node[kind=\"fnode-internal\"]', style: {
+            'shape': 'barrel',
+            'background-color': T.bg_node_fn,
+            'border-color': T.input_color,
+            'border-width': 1.2,
+            'border-style': 'dashed',
+            'label': 'data(label)',
+            'color': T.text_dim,
+            'text-valign': 'center', 'text-halign': 'center',
+            'text-wrap': 'wrap', 'text-max-width': 280,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            'font-size': 11,
+            'font-style': 'italic',
+            'padding': 10,
+            'width': 'label', 'height': 'label',
+        }},
+        // Edges — base style for every edge (including the meta-edges the
+        // expand-collapse plugin synthesises between collapsed compounds).
+        { selector: 'edge', style: {
+            'width': 1.2,
+            'line-color': T.transform_color,
+            'target-arrow-color': T.transform_color,
+            'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier',
+            'arrow-scale': 0.8,
+        }},
+        // Only edges that actually carry a `label` field can ever get text
+        // rendered — mapping `data(label)` onto edges without that field
+        // triggers cytoscape warnings and (under expand-collapse) a
+        // re-style crash. `min-zoomed-font-size` does the show-when-readable
+        // trick: at the overview zoom level the effective font size falls
+        // below 9px and cytoscape hides the labels automatically, so the
+        // graph reads as shapes; zoom in on a region and every label
+        // appears once the text is big enough to actually read. Hover
+        // overrides below set `text-opacity: 1` so highlighted edges
+        // always show their labels regardless of zoom.
+        { selector: 'edge[label]', style: {
+            'label': 'data(label)',
+            'min-zoomed-font-size': 9,
+            'text-rotation': 'autorotate',
+            'text-margin-y': -8,
+            'font-size': 10,
+            'color': T.text_dim,
+            'text-background-color': T.bg_panel,
+            'text-background-opacity': 0.85,
+            'text-background-padding': 2,
+            'font-family': 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        }},
+        { selector: 'edge[kind=\"input\"]', style: {
+            'line-color': T.input_color,
+            'target-arrow-shape': 'circle',
+            'target-arrow-color': T.input_color,
+            'width': 1.4,
+        }},
+        { selector: 'edge[kind=\"output\"]', style: {
+            'line-color': T.output_color,
+            'target-arrow-color': T.output_color,
+            'width': 1.6,
+        }},
+        // Highlight / dim classes — applied dynamically.
+        { selector: '.dim', style: { 'opacity': 0.28 } },
+        { selector: '.hl', style: { 'opacity': 1 } },
+        { selector: 'node.hl-self', style: {
+            'border-color': T.accent, 'border-width': 3,
+        }},
+        { selector: 'edge.hl-in', style: { 'width': 3, 'line-color': T.input_color, 'target-arrow-color': T.input_color, 'text-opacity': 1, 'color': T.text } },
+        { selector: 'edge.hl-out', style: { 'width': 3, 'line-color': T.output_color, 'target-arrow-color': T.output_color, 'text-opacity': 1, 'color': T.text } },
+        // When the user has clicked-to-focus a node, every edge in its
+        // neighborhood gets `hl-focus` so its label is readable.
+        { selector: 'edge.hl-focus[label]', style: { 'text-opacity': 1, 'color': T.text } },
+        // Hovering the edge itself: thicken it, reveal its label.
+        { selector: 'edge.hl-edge', style: {
+            'width': 3,
+            'line-color': T.accent,
+            'target-arrow-color': T.accent,
+            'text-opacity': 1,
+            'color': T.text,
+        }},
+      ],
+      layout: {
+        name: 'fcose',
+        quality: 'proof',
+        randomize: false,
+        animate: false,
+        nodeSeparation: 150,
+        idealEdgeLength: 180,
+        nodeRepulsion: 8000,
+        packComponents: true,
+        tile: true,
+        gravityRangeCompound: 1.5,
+        gravityCompound: 1.0,
+      },
+    });
+
+    // expand-collapse: double-click a module to fold/unfold it. The
+    // post-collapse/expand layout uses `randomize: false` so fcose
+    // starts from existing positions and only nudges things to make
+    // room — a fully fresh random layout shuffles every module on
+    // every expand.
+    cy.expandCollapse({
+      layoutBy: { name: 'fcose', randomize: false, animate: false, fit: false,
+                  nodeSeparation: 150, idealEdgeLength: 180, nodeRepulsion: 8000,
+                  quality: 'default' },
+      fisheye: false,
+      animate: true,
+      animationDuration: 200,
+      undoable: false,
+      cueEnabled: false,
+    });
+    const ec = cy.expandCollapse('get');
+
+    // When a module collapses, prefix its label with `▸ ` so the chevron
+    // makes \"this is something you click to open\" unmistakable. Strip
+    // the chevron back off when it expands again.
+    const CHEVRON = '▸ ';
+    function markCollapsed(n) {
+      const lbl = n.data('label');
+      if (lbl && !lbl.startsWith(CHEVRON)) n.data('label', CHEVRON + lbl);
+    }
+    function unmarkCollapsed(n) {
+      const lbl = n.data('label');
+      if (lbl && lbl.startsWith(CHEVRON)) n.data('label', lbl.slice(CHEVRON.length));
+    }
+    cy.on('expandcollapse.aftercollapse', 'node', (evt) => markCollapsed(evt.target));
+    cy.on('expandcollapse.afterexpand', 'node', (evt) => unmarkCollapsed(evt.target));
+
+    // Start with every module collapsed — far less visual load on first
+    // view. The user expands the modules they care about. Defer until
+    // after the initial layout settles, otherwise expand-collapse can
+    // crash trying to restyle elements that cytoscape is still creating.
+    requestAnimationFrame(() => {
+      try { ec.collapseAll(); }
+      catch (e) { console.warn('collapseAll failed, leaving expanded:', e); }
+      // Always fit, even if collapseAll threw — otherwise an
+      // expand-collapse hiccup leaves the user staring at an off-
+      // viewport graph.
+      cy.fit(null, 60);
+    });
+    cy.on('dbltap', ':parent', (evt) => {
+      const t = evt.target;
+      if (ec.isCollapsible(t)) ec.collapse(t);
+      else if (ec.isExpandable(t)) ec.expand(t);
+    });
+
+    // Hover: highlight 1-hop predecessors (input edges) and successors
+    // (output edges) AND the neighbor nodes themselves. Dim everything
+    // else.
+    //
+    // `keep` includes:
+    //   - the hovered node + its closed neighborhood (neighbors + edges)
+    //   - every ancestor compound of any kept node — cytoscape's
+    //     opacity cascades from a compound to its children, so if a
+    //     neighbor's module is dim, the neighbor renders dim too.
+    cy.on('mouseover', 'node', (evt) => {
+      const n = evt.target;
+      if (n.isParent()) return;
+      const hood = n.closedNeighborhood();
+      const keep = hood.union(hood.ancestors());
+      cy.elements().not(keep).addClass('dim');
+      n.addClass('hl-self');
+      hood.nodes().not(n).addClass('hl-neighbor');
+      n.incomers('edge').addClass('hl-in');
+      n.outgoers('edge').addClass('hl-out');
+    });
+    cy.on('mouseout', 'node', () => {
+      cy.elements().removeClass('dim hl-self hl-neighbor hl-in hl-out');
+    });
+
+    // Undo stack for view changes. We snapshot the *visibility* state
+    // of every element (which are hidden, which are shown) plus the
+    // current focus level/node before any narrowing action runs.
+    // `Ctrl+Z` / `Cmd+Z` and the toolbar 'undo' button pop the most
+    // recent snapshot. Cap the stack so a long browsing session
+    // doesn't leak memory.
+    const UNDO_MAX = 30;
+    const undoStack = [];
+    function snapshotView() {
+      const hidden = [];
+      cy.nodes().forEach((n) => { if (n.style('display') === 'none') hidden.push(n.id()); });
+      return { hidden, focusedId: focused ? focused.id() : null, focusLevel };
+    }
+    function pushUndo() {
+      undoStack.push(snapshotView());
+      while (undoStack.length > UNDO_MAX) undoStack.shift();
+    }
+    function restoreView(snap) {
+      const hiddenSet = new Set(snap.hidden);
+      cy.nodes().forEach((n) => {
+        n.style('display', hiddenSet.has(n.id()) ? 'none' : 'element');
+      });
+      if (snap.focusedId) {
+        focused = cy.getElementById(snap.focusedId);
+        focusLevel = snap.focusLevel;
+        cy.elements('edge').removeClass('hl-focus');
+        const keep = computeKeep(focused);
+        keep.edges().addClass('hl-focus');
+        const lbl = (focused.data('label') || focused.id()).split('\\n')[0];
+        const hint = focusLevel === 2
+          ? ' — all neighbors (click again to reset)'
+          : ' (click again to include hidden neighbors)';
+        focusInfo.innerHTML = 'focused on <code>' + lbl + '</code>' + hint;
+        focusInfo.classList.add('active');
+      } else {
+        focused = null;
+        focusLevel = 0;
+        cy.elements('edge').removeClass('hl-focus');
+        focusInfo.classList.remove('active');
+      }
+    }
+    function undo() {
+      if (undoStack.length === 0) return;
+      restoreView(undoStack.pop());
+    }
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
+    });
+
+    // Click a node = focus mode, with two narrowing levels:
+    //
+    //   Level 1 (first click): hide every currently-visible element
+    //   that isn't in this node's neighborhood. Already-hidden nodes
+    //   stay hidden, so this narrows in *within* the current view.
+    //
+    //   Level 2 (click the same node again): same as level 1 *plus*
+    //   resurrect any previously-hidden neighbors. Useful when you've
+    //   manually hidden things and want to bring them back to see the
+    //   node's full surroundings.
+    //
+    //   Level 3 (third click): unfocus.
+    //
+    // For an expanded module compound, the \"neighborhood\" is the
+    // union of the module + all its children + every node any child
+    // is connected to — answering \"who does this module talk to?\"
+    let focused = null;
+    let focusLevel = 0;
+    const focusInfo = document.getElementById('focus-info');
+    function computeKeep(node) {
+      if (node.isParent()) {
+        const inside = node.union(node.descendants());
+        return inside.union(node.descendants().closedNeighborhood());
+      }
+      return node.closedNeighborhood();
+    }
+    function focusOn(node, resurrect) {
+      focused = node;
+      const keep = computeKeep(node);
+      cy.elements().difference(keep).style('display', 'none');
+      if (resurrect) keep.style('display', 'element');
+      cy.elements('edge').removeClass('hl-focus');
+      keep.edges().addClass('hl-focus');
+      cy.fit(keep.filter(el => el.visible()), 40);
+      const lbl = (node.data('label') || node.id()).split('\\n')[0];
+      const hint = resurrect
+        ? ' — all neighbors (click again to reset)'
+        : ' (click again to include hidden neighbors)';
+      focusInfo.innerHTML = 'focused on <code>' + lbl + '</code>' + hint;
+      focusInfo.classList.add('active');
+    }
+    function unfocus() {
+      focused = null;
+      focusLevel = 0;
+      cy.elements().style('display', 'element');
+      cy.elements('edge').removeClass('hl-focus');
+      focusInfo.classList.remove('active');
+      cy.fit(null, 40);
+    }
+    cy.on('tap', 'node', (evt) => {
+      const n = evt.target;
+      // Tapping a collapsed compound expands it — focusing on a collapsed
+      // module just shows meta-edges to other modules, hiding every type
+      // and function inside, which is the opposite of what the user
+      // wants. Expanding reveals the contents; a follow-up tap on the
+      // expanded compound focuses on its full neighborhood.
+      if (ec.isExpandable(n)) { ec.expand(n); return; }
+      // Functions are verbs — tapping one is an action: jump to its
+      // hex docs / github source.
+      const kind = n.data('kind');
+      if (kind === 'fnode' || kind === 'fnode-internal') {
+        const href = n.data('href');
+        if (href) window.open(href, '_blank');
+        return;
+      }
+      // Type nodes (nouns) and expanded module compounds focus, with
+      // repeated taps on the same node cycling through narrowing levels.
+      pushUndo();
+      if (focused && focused.same(n)) {
+        if (focusLevel === 1) {
+          focusLevel = 2;
+          focusOn(n, true);
+        } else {
+          unfocus();
+        }
+      } else {
+        focusLevel = 1;
+        focusOn(n, false);
+      }
+    });
+    cy.on('tap', (evt) => {
+      if (evt.target === cy && focused) { pushUndo(); unfocus(); }
+    });
+
+    // Click a labelled edge (= a single-arg function) to open its
+    // source. These edges represent functions like
+    // `bytes_tree.from_string_tree(StringTree) -> BytesTree` that
+    // aren't fan-in nodes but are still callable code.
+    cy.on('tap', 'edge', (evt) => {
+      const href = evt.target.data('href');
+      if (href) window.open(href, '_blank');
+    });
+    // Hover an edge: same dim-everything-else treatment as hovering
+    // a node, but the \"keep\" set is the edge + its source + target
+    // (and their ancestor compounds, so dimming a parent doesn't
+    // cascade down to the endpoints). The edge itself gets `hl-edge`
+    // so the label appears and the line thickens.
+    cy.on('mouseover', 'edge', (evt) => {
+      const e = evt.target;
+      if (e.data('href')) cyEl.classList.add('cy-pointing');
+      const endpoints = e.source().union(e.target());
+      const keep = endpoints.union(e).union(endpoints.ancestors());
+      cy.elements().not(keep).addClass('dim');
+      endpoints.addClass('hl-neighbor');
+      e.addClass('hl-edge');
+    });
+    cy.on('mouseout', 'edge', () => {
+      cyEl.classList.remove('cy-pointing');
+      cy.elements().removeClass('dim hl-neighbor hl-edge');
+    });
+
+    // Right-click context menu. Sticky HTML menu — appears on right-
+    // click, stays until the user picks an option or clicks elsewhere.
+    // The radial cxtmenu plugin closes on mouse-release, which surprised
+    // anyone who right-clicks and lifts off before dragging to a slice.
+    const ctxMenu = document.createElement('div');
+    ctxMenu.className = 'ctx-menu';
+    ctxMenu.style.display = 'none';
+    document.body.appendChild(ctxMenu);
+    function showCtxMenu(node, x, y) {
+      const items = [];
+      items.push({ label: 'focus neighbors', fn: () => focusOn(node) });
+      if (ec.isExpandable(node)) {
+        items.push({ label: 'expand module', fn: () => ec.expand(node) });
+      } else if (ec.isCollapsible(node)) {
+        items.push({ label: 'collapse module', fn: () => ec.collapse(node) });
+      }
+      const href = node.data('href');
+      if (href) items.push({ label: 'open source ↗', fn: () => window.open(href, '_blank') });
+      items.push({ label: 'hide', fn: () => { pushUndo(); node.style('display', 'none'); } });
+      ctxMenu.innerHTML = '';
+      items.forEach((it) => {
+        const b = document.createElement('button');
+        b.textContent = it.label;
+        b.addEventListener('click', () => { hideCtxMenu(); it.fn(); });
+        ctxMenu.appendChild(b);
+      });
+      // Clamp inside the viewport so the menu doesn't fall off-screen.
+      const vw = window.innerWidth, vh = window.innerHeight;
+      ctxMenu.style.display = 'block';
+      const w = ctxMenu.offsetWidth, h = ctxMenu.offsetHeight;
+      ctxMenu.style.left = Math.min(x, vw - w - 4) + 'px';
+      ctxMenu.style.top = Math.min(y, vh - h - 4) + 'px';
+    }
+    function hideCtxMenu() { ctxMenu.style.display = 'none'; }
+    cy.on('cxttap', 'node', (evt) => {
+      const pos = evt.originalEvent;
+      showCtxMenu(evt.target, pos.clientX, pos.clientY);
+    });
+    // Any click outside the menu (including taps on the canvas or
+    // another node) dismisses it.
+    document.addEventListener('mousedown', (e) => {
+      if (!ctxMenu.contains(e.target)) hideCtxMenu();
+    });
+    cy.on('tap pan zoom', hideCtxMenu);
+
+    // Magnetic drag: when the user drags a node, every connected
+    // neighbor drifts by a fraction of the drag delta — as if the
+    // edges were elastic. `PULL = 0.4` of the delta for direct
+    // neighbors, `PULL_2 = 0.15` for neighbors-of-neighbors so the
+    // influence softly fades. Compound modules and locked nodes are
+    // ignored.
+    const PULL = 0.4;
+    const PULL_2 = 0.15;
+    let magneticDrag = true; // toggled by the freeze button
+    let dragAnchor = null;
+    cy.on('grab', 'node', (evt) => {
+      const n = evt.target;
+      if (!magneticDrag) { dragAnchor = null; return; }
+      if (n.isParent()) { dragAnchor = null; return; }
+      dragAnchor = { id: n.id(), x: n.position('x'), y: n.position('y') };
+    });
+    cy.on('drag', 'node', (evt) => {
+      const n = evt.target;
+      if (!dragAnchor || dragAnchor.id !== n.id()) return;
+      const cur = n.position();
+      const dx = cur.x - dragAnchor.x;
+      const dy = cur.y - dragAnchor.y;
+      dragAnchor = { id: n.id(), x: cur.x, y: cur.y };
+      const neighbors = n.openNeighborhood('node')
+        .filter(m => !m.locked() && !m.isParent() && !m.same(n));
+      neighbors.forEach(m => {
+        const p = m.position();
+        m.position({ x: p.x + dx * PULL, y: p.y + dy * PULL });
+      });
+      const second = neighbors.openNeighborhood('node')
+        .difference(neighbors).difference(n)
+        .filter(m => !m.locked() && !m.isParent());
+      second.forEach(m => {
+        const p = m.position();
+        m.position({ x: p.x + dx * PULL_2, y: p.y + dy * PULL_2 });
+      });
+    });
+    cy.on('free', 'node', () => { dragAnchor = null; });
+
+    // Cursor management: classes on #cy override the base `grab` cursor.
+    // `cy-pointing` shows the finger only over nodes whose left-click
+    // actually does something — a type node (focus), a function node with
+    // an href (opens source), or a collapsed module (expand). Function
+    // nodes without an href, or expanded compounds, keep the open-hand
+    // cursor because the only thing you can do with them is drag.
+    // `cy-grabbing` shows the closed hand while panning or dragging.
+    const cyEl = document.getElementById('cy');
+    function isInteractable(n) {
+      // Collapsed module → click to expand. Expanded module → click to
+      // focus on its neighborhood. Either way it's clickable.
+      if (ec.isExpandable(n)) return true;
+      if (n.isParent()) return true;
+      const kind = n.data('kind');
+      if (kind === 'tnode' || kind === 'tnode-internal') return true;
+      if ((kind === 'fnode' || kind === 'fnode-internal') && n.data('href')) return true;
+      return false;
+    }
+    cy.on('mouseover', 'node', (evt) => {
+      if (isInteractable(evt.target)) cyEl.classList.add('cy-pointing');
+    });
+    cy.on('mouseout', 'node', () => cyEl.classList.remove('cy-pointing'));
+    cy.on('grabon', 'node', () => cyEl.classList.add('cy-grabbing'));
+    cy.on('freeon', 'node', () => cyEl.classList.remove('cy-grabbing'));
+    cyEl.addEventListener('mousedown', () => cyEl.classList.add('cy-grabbing'));
+    window.addEventListener('mouseup', () => cyEl.classList.remove('cy-grabbing'));
+
+    document.getElementById('btn-collapse-all').addEventListener('click', () => {
+      ec.collapseAll();
+    });
+    document.getElementById('btn-expand-all').addEventListener('click', () => {
+      ec.expandAll();
+    });
+    document.getElementById('btn-fit').addEventListener('click', () => {
+      if (focused) cy.fit(focused.closedNeighborhood(), 40);
+      else cy.fit(null, 40);
+    });
+    document.getElementById('btn-freeze').addEventListener('click', (e) => {
+      magneticDrag = !magneticDrag;
+      e.target.textContent = magneticDrag ? 'freeze drag' : 'unfreeze drag';
+      e.target.dataset.on = magneticDrag ? 'true' : 'false';
+    });
+  </script>
+</body>
+</html>"
+}
+
+/// Theme record → small JS object so the cytoscape stylesheet can reference
+/// the same palette as the rest of the page.
+fn theme_json(t: Theme) -> String {
+  "{ "
+  <> "bg_panel: \"" <> t.bg_panel <> "\", "
+  <> "bg_cluster: \"" <> t.bg_cluster <> "\", "
+  <> "bg_node_type: \"" <> t.bg_node_type <> "\", "
+  <> "bg_node_fn: \"" <> t.bg_node_fn <> "\", "
+  <> "accent: \"" <> t.accent <> "\", "
+  <> "accent_dim: \"" <> t.accent_dim <> "\", "
+  <> "text: \"" <> t.text <> "\", "
+  <> "text_dim: \"" <> t.text_dim <> "\", "
+  <> "transform_color: \"" <> t.transform_color <> "\", "
+  <> "input_color: \"" <> t.input_color <> "\", "
+  <> "output_color: \"" <> t.output_color <> "\""
+  <> " }"
 }
 
 // ---------------------------------------------------------------------------
