@@ -1590,6 +1590,22 @@ fn cytoscape_html_template(
             'text-opacity': 1,
             'color': T.text,
         }},
+        // Hover highlight: every node that's being lit up — the
+        // hovered node itself or any of its neighbors / the endpoints
+        // of a hovered edge — triples in apparent size so it pops out
+        // of the surrounding context. Cytoscape sizes nodes from their
+        // label (`width:'label'`), so jacking the font-size auto-scales
+        // the whole node box.
+        { selector: 'node[kind=\"tnode\"].hl-self, node[kind=\"tnode-internal\"].hl-self, node[kind=\"tnode\"].hl-neighbor, node[kind=\"tnode-internal\"].hl-neighbor', style: {
+            'font-size': 36,
+            'border-width': 3,
+            'padding': 14,
+        }},
+        { selector: 'node[kind=\"fnode\"].hl-self, node[kind=\"fnode-internal\"].hl-self, node[kind=\"fnode\"].hl-neighbor, node[kind=\"fnode-internal\"].hl-neighbor', style: {
+            'font-size': 30,
+            'border-width': 3,
+            'padding': 16,
+        }},
       ],
       layout: {
         name: 'fcose',
