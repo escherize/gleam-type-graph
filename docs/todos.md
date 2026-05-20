@@ -13,6 +13,16 @@ they come up so they don't get lost.
   the grow-and-shrink animates over ~120ms with an ease-out curve.
   Same for `hl-edge`'s width and `hl-in`/`hl-out`.
 
+- **Keep the activating node in view after focusing.** When the user
+  clicks a node to focus its neighbors, `cy.fit(keep, 40)` repositions
+  the camera on the kept set's bounding box. The clicked node ends up
+  somewhere inside that box but not necessarily at the same screen
+  position the user clicked. Result: the user's eye loses where they
+  were. Fix: instead of re-fitting from scratch, pan/zoom so the
+  activating node stays at (or near) the screen coordinates of the
+  click, with the camera widening just enough to fit the neighborhood
+  around it.
+
 ## layout
 
 - **Orbital constraints** — see [`orbital-layout.md`](orbital-layout.md).
